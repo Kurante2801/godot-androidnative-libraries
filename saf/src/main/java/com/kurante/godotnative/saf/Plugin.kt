@@ -6,14 +6,23 @@ import android.content.Intent
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import com.kurante.godotnative.saf.Plugin.Companion.Activity.OPEN_DOCUMENT
+import com.kurante.godotnative.saf.Plugin.Companion.Activity.READ_BYTES
 import com.kurante.godotnative.saf.Plugin.Companion.Signal.OPEN_DOCUMENT_ERROR
-import com.kurante.godotnative.saf.Plugin.Companion.Signal.OPEN_DOCUMENT_INFO
+import com.kurante.godotnative.saf.Plugin.Companion.Signal.OPEN_DOCUMENT_DATA
+import com.kurante.godotnative.saf.Plugin.Companion.Signal.READ_BYTES_DATA
+import com.kurante.godotnative.saf.Plugin.Companion.Signal.READ_BYTES_ERROR
+import com.kurante.godotnative.saf.extensions.toDocumentFile
 import com.kurante.godotnative.saf.extensions.toGodotDictionary
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import org.godotengine.godot.Dictionary
 import org.godotengine.godot.Godot
 import org.godotengine.godot.plugin.GodotPlugin
 import org.godotengine.godot.plugin.SignalInfo
 import org.godotengine.godot.plugin.UsedByGodot
+import java.io.InputStream
 
 class Plugin(godot: Godot) : GodotPlugin(godot) {
     override fun getPluginName() = "AndroidNativeSAF"
@@ -22,20 +31,28 @@ class Plugin(godot: Godot) : GodotPlugin(godot) {
         const val INITIAL_CODE = 2801
 
         enum class Activity {
-            OPEN_DOCUMENT
+            OPEN_DOCUMENT,
+            READ_BYTES, // Not an activity, but we can reuse the await system we have on godot
         }
 
-        enum class Signal(val signal: String) {
-            OPEN_DOCUMENT_ERROR("open_document_error"), OPEN_DOCUMENT_INFO("open_document_info"),
+        enum class Signal {
+            OPEN_DOCUMENT_ERROR,
+            OPEN_DOCUMENT_DATA,
+            READ_BYTES_ERROR,
+            READ_BYTES_DATA,
         }
     }
 
     override fun getPluginSignals() = setOf(
-        SignalInfo(OPEN_DOCUMENT_ERROR.signal, Int::class.javaObjectType, String::class.javaObjectType),
-        SignalInfo(OPEN_DOCUMENT_INFO.signal, Int::class.javaObjectType, Dictionary::class.javaObjectType),
+        SignalInfo(OPEN_DOCUMENT_ERROR.name.lowercase(), Int::class.javaObjectType, String::class.javaObjectType),
+        SignalInfo(OPEN_DOCUMENT_DATA.name.lowercase(), Int::class.javaObjectType, Dictionary::class.javaObjectType),
+        SignalInfo(READ_BYTES_ERROR.name.lowercase(), Int::class.javaObjectType, String::class.javaObjectType),
+        SignalInfo(READ_BYTES_DATA.name.lowercase(), Int::class.javaObjectType, ByteArray::class.javaObjectType),
     )
 
-    //private fun signal(signal: Signal, vararg args: Any) = emitSignal(signal.signal, args)
+    private fun signal(signal: Signal, vararg args: Any) = runOnRenderThread {
+        emitSignal(signal.name.lowercase(), *args)
+    }
 
     private val requests = mutableMapOf<Int, Activity>()
 
@@ -57,6 +74,7 @@ class Plugin(godot: Godot) : GodotPlugin(godot) {
 
         when (activity) {
             OPEN_DOCUMENT -> open_document_response(requestCode, resultCode, data)
+            else -> {}
         }
     }
 
@@ -79,7 +97,7 @@ class Plugin(godot: Godot) : GodotPlugin(godot) {
             putExtra("PERSIST", persist)
         }
 
-        runOnRenderThread {
+        runOnUiThread {
             activity!!.startActivityForResult(intent, code)
         }
 
@@ -89,12 +107,47 @@ class Plugin(godot: Godot) : GodotPlugin(godot) {
     @Suppress("FunctionName")
     @SuppressLint("UseRequireInsteadOfGet")
     fun open_document_response(code: Int, result: Int, data: Intent?) {
-        if (result != RESULT_OK) return emitSignal(OPEN_DOCUMENT_ERROR.signal, code, "User cancelled operation")
+        if (result != RESULT_OK) return signal(OPEN_DOCUMENT_ERROR, code, "User cancelled operation")
 
-        val uri = data?.data ?: return emitSignal(OPEN_DOCUMENT_ERROR.signal, code, "Could not get Intent's Uri")
+        val uri = data?.data ?: return signal(OPEN_DOCUMENT_ERROR, code, "Could not get Intent's Uri")
         val document = DocumentFile.fromSingleUri(activity!!, uri)!!
 
         if (data.getBooleanExtra("PERSIST", false)) persistUri(uri)
-        emitSignal(OPEN_DOCUMENT_INFO.signal, code, document.toGodotDictionary())
+        signal(OPEN_DOCUMENT_DATA, code, document.toGodotDictionary())
+    }
+
+    @UsedByGodot
+    @Suppress("FunctionName")
+    fun read_bytes(uri: String): Int {
+        val document = Uri.parse(uri).toDocumentFile(activity!!)
+        val code = getCode(READ_BYTES)
+
+        CoroutineScope(Dispatchers.IO).launch {
+            lateinit var stream: InputStream
+
+            val error = when {
+                !document.exists() -> "File doesn't exist"
+                !document.canRead() -> "File can't be read"
+                else -> {
+                    try {
+                        stream = activity!!.contentResolver.openInputStream(document.uri)!!
+                        null
+                    } catch (e: Exception) { e.message }
+                }
+            }
+
+            // Launch the error with a bit of delay, so Godot has the chance to register the code we send
+            if (error != null) {
+                delay(100)
+                signal(OPEN_DOCUMENT_ERROR, code, error)
+                return@launch
+            }
+
+            stream.use {
+                signal(READ_BYTES_DATA, code, it.readBytes())
+            }
+        }
+
+        return code
     }
 }
