@@ -279,5 +279,11 @@ class Plugin(godot: Godot) : NativePlugin("AndroidNativeSAF", godot) {
         val data = children.map { it.toGodotDictionary(true) }.toTypedArray()
         return dictionary.data(data.toDictionary())
     }
+
+    @UsedByGodot
+    @Suppress("FunctionName")
+    fun document_from_uri(uri: String): Dictionary {
+        return Uri.parse(uri).toDocumentFile(activity!!).toGodotDictionary()
+    }
 }
 
