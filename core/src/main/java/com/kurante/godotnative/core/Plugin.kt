@@ -7,9 +7,7 @@ import org.godotengine.godot.Godot
 import org.godotengine.godot.plugin.GodotPlugin
 import org.godotengine.godot.plugin.UsedByGodot
 
-class Plugin(godot: Godot) : GodotPlugin(godot) {
-    override fun getPluginName() = "AndroidNativeCore"
-
+class Plugin(godot: Godot) : NativePlugin("AndroidNativeCore", godot) {
     @UsedByGodot
     fun toast(text: String, long: Boolean) = runOnUiThread {
         if (activity != null)
