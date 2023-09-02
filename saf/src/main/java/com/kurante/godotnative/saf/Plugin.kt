@@ -1,15 +1,16 @@
 package com.kurante.godotnative.saf
 
-import android.annotation.SuppressLint
 import android.app.Activity.RESULT_OK
 import android.content.Intent
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import com.kurante.godotnative.core.NativePlugin
-import com.kurante.godotnative.saf.extensions.code
-import com.kurante.godotnative.saf.extensions.data
-import com.kurante.godotnative.saf.extensions.error
+import com.kurante.godotnative.core.extensions.code
+import com.kurante.godotnative.core.extensions.data
+import com.kurante.godotnative.core.extensions.error
+import com.kurante.godotnative.saf.extensions.isTree
 import com.kurante.godotnative.saf.extensions.persist
+import com.kurante.godotnative.core.extensions.toDictionary
 import com.kurante.godotnative.saf.extensions.toDocumentFile
 import com.kurante.godotnative.saf.extensions.toGodotDictionary
 import kotlinx.coroutines.CoroutineScope
@@ -23,19 +24,19 @@ import org.godotengine.godot.plugin.UsedByGodot
 import java.io.InputStream
 
 class Plugin(godot: Godot) : NativePlugin("AndroidNativeSAF", godot) {
+    companion object {
+        const val RESULT_SIGNAL = "result"
+    }
     enum class Activity {
-        OPEN_DOCUMENT, READ_BYTES_ASYNC
+        NONE, OPEN_DOCUMENT, OPEN_DOCUMENT_TREE
     }
 
     override fun getPluginSignals() = setOf(
-        signalInfo<Dictionary>(Activity.OPEN_DOCUMENT),
-        signalInfo<Dictionary>(Activity.READ_BYTES_ASYNC),
+        SignalInfo(RESULT_SIGNAL, Dictionary::class.javaObjectType)
     )
 
-    private inline fun <reified T : Any> signalInfo(activity: Activity,) =
-        SignalInfo(activity.name.lowercase(), T::class.javaObjectType)
+    private fun signalResult(result: Dictionary) = emitSignal(RESULT_SIGNAL, result)
 
-    private fun signal(activity: Activity, vararg args: Any) = signal(activity.name.lowercase(), *args)
 
     private val requests = mutableMapOf<Int, Activity>()
 
@@ -48,8 +49,11 @@ class Plugin(godot: Godot) : NativePlugin("AndroidNativeSAF", godot) {
 
     override fun onActivityCode(code: Int, result: Int, data: Intent?) {
         val activity = requests[code] ?: return
+        requests.remove(code)
+
         when (activity) {
             Activity.OPEN_DOCUMENT -> open_document_response(code, result, data)
+            Activity.OPEN_DOCUMENT_TREE -> open_document_tree_response(code, result, data)
             else -> {}
         }
     }
@@ -85,13 +89,13 @@ class Plugin(godot: Godot) : NativePlugin("AndroidNativeSAF", godot) {
     @Suppress("FunctionName")
     private fun open_document_response(code: Int, result: Int, data: Intent?) {
         val dictionary = Dictionary().code(code)
-        if (result != RESULT_OK) return signal(Activity.OPEN_DOCUMENT, dictionary.error("User cancelled operation"))
+        if (result != RESULT_OK) return signalResult(dictionary.error("User cancelled operation"))
 
-        val uri = data?.data ?: return signal(Activity.OPEN_DOCUMENT, dictionary.error("Could not get Intent's Uri"))
+        val uri = data?.data ?: return signalResult(dictionary.error("Could not get Intent's Uri"))
         val document = DocumentFile.fromSingleUri(activity!!, uri)!!
 
         if (data.getBooleanExtra("PERSIST", false)) uri.persist(activity!!)
-        signal(Activity.OPEN_DOCUMENT, dictionary.data(document.toGodotDictionary()))
+        signalResult(dictionary.data(document.toGodotDictionary(false)))
     }
 
     /**
@@ -123,12 +127,12 @@ class Plugin(godot: Godot) : NativePlugin("AndroidNativeSAF", godot) {
     }
 
     /**
-     * Return a code, then read bytes on the IO scope and signals with the code
+     * Returns a code, then reads bytes on the IO scope and signals with the code
      */
     @UsedByGodot
     @Suppress("FunctionName")
     fun read_bytes(uri: String): Int {
-        val code = getCode(Activity.READ_BYTES_ASYNC)
+        val code = getCode(Activity.NONE)
 
         CoroutineScope(Dispatchers.IO).launch {
             val dictionary = Dictionary().code(code)
@@ -150,18 +154,130 @@ class Plugin(godot: Godot) : NativePlugin("AndroidNativeSAF", godot) {
 
             if (error != null) {
                 delay(100) // Tiny delay so Godot gets the code before this signal
-                signal(Activity.READ_BYTES_ASYNC, dictionary.error(error))
+                signalResult(dictionary.error(error))
+                requests.remove(code)
                 return@launch
             }
 
             stream.use {
-                signal(Activity.READ_BYTES_ASYNC, dictionary.data(it.readBytes()))
+                signalResult(dictionary.data(it.readBytes()))
             }
+            requests.remove(code)
         }
 
         return code
     }
 
+    /**
+     * Launches an Intent.ACTION_OPEN_DOCUMENT_TREE and returns the code that will be used in a future response.
+     */
+    @UsedByGodot
+    @Suppress("FunctionName")
+    fun open_document_tree(persist: Boolean): Int {
+        val code = getCode(Activity.OPEN_DOCUMENT_TREE)
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            if (persist) addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
 
+            putExtra("PERSIST", persist)
+        }
+
+        runOnUiThread {
+            activity!!.startActivityForResult(intent, code)
+        }
+
+        return code
+    }
+
+    /**
+     * Emits OPEN_DOCUMENT_TREE with a code and a dictionary
+     */
+    @Suppress("FunctionName")
+    private fun open_document_tree_response(code: Int, result: Int, data: Intent?) {
+        val dictionary = Dictionary().code(code)
+        if (result != RESULT_OK) return signalResult(dictionary.error("User cancelled operation"))
+
+        val uri = data?.data ?: return signalResult(dictionary.error("Could not get Intent's Uri"))
+        val document = DocumentFile.fromTreeUri(activity!!, uri)!!
+
+        if (data.getBooleanExtra("PERSIST", false)) uri.persist(activity!!)
+        signalResult(dictionary.data(document.toGodotDictionary(true)))
+    }
+
+    /**
+     * Returns a code, then reads DocumentFile's children and signals with the code
+     */
+    @UsedByGodot
+    @Suppress("FunctionName")
+    fun list_files(uri: String): Int {
+        val code = getCode(Activity.NONE)
+
+        CoroutineScope(Dispatchers.IO).launch {
+            val dictionary = Dictionary().code(code)
+            val document = Uri.parse(uri).toDocumentFile(activity!!)
+            lateinit var children: Array<DocumentFile>
+
+            val error = when {
+                !document.exists() -> "Directory doesn't exist"
+                !document.canRead() -> "Directory can't be read"
+                !document.isDirectory -> "Document is not a directory"
+                !document.uri.isTree -> "Document is a single uri and not a tree uri"
+                else -> {
+                    try  {
+                        // This call is the reason the entire function is async, listFiles is SLOW
+                        children = document.listFiles()
+                        null
+                    } catch (e: Exception) {
+                        e.message
+                    }
+                }
+            }
+
+            if (error != null) {
+                delay(100)
+                signalResult(dictionary.error(error))
+                requests.remove(code)
+                return@launch
+            }
+
+            val data = children.map { it.toGodotDictionary(true) }.toTypedArray()
+            signalResult(dictionary.data(data.toDictionary()))
+
+            requests.remove(code)
+        }
+
+        return code
+    }
+
+    /**
+     * Returns children of a DocumentFile tree (not recursive), slow
+     */
+    @UsedByGodot
+    @Suppress("FunctionName")
+    fun list_files_sync(uri: String): Dictionary {
+        val dictionary = Dictionary()
+        val document = Uri.parse(uri).toDocumentFile(activity!!)
+        lateinit var children: Array<DocumentFile>
+
+        val error = when {
+            !document.exists() -> "Directory doesn't exist"
+            !document.canRead() -> "Directory can't be read"
+            !document.isDirectory -> "Document is not a directory"
+            !document.uri.isTree -> "Document is a single uri and not a tree uri"
+            else -> {
+                try  {
+                    children = document.listFiles()
+                    null
+                } catch (e: Exception) {
+                    e.message
+                }
+            }
+        }
+
+        if (error != null)
+            return dictionary.error(error)
+        val data = children.map { it.toGodotDictionary(true) }.toTypedArray()
+        return dictionary.data(data.toDictionary())
+    }
 }
 

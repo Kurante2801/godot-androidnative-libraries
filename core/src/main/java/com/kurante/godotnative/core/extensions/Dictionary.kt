@@ -1,4 +1,4 @@
-package com.kurante.godotnative.saf.extensions
+package com.kurante.godotnative.core.extensions
 
 import org.godotengine.godot.Dictionary
 
